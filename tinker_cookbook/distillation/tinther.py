@@ -795,9 +795,6 @@ class _TrainerBackend:
                 metrics[f"train/{k}"] = float(v)
         return OptimStepResponse(metrics=metrics)
 
-    async def save_state(self, name: str) -> _SavePath:
-        return await asyncio.to_thread(self._save_state_sync, name)
-
     def _new_distributed_checkpoint_path(
         self, kind: Literal["state", "sampler"], name: str
     ) -> tuple[str, Path]:
@@ -807,6 +804,9 @@ class _TrainerBackend:
         if not isinstance(shared_name, str):
             raise TinkerError(f"Could not broadcast checkpoint name for {kind}")
         return _CheckpointStore.new_path(kind, name=shared_name)
+
+    async def save_state(self, name: str) -> _SavePath:
+        return await asyncio.to_thread(self._save_state_sync, name)
 
     def _save_state_sync(self, name: str) -> _SavePath:
         path, d = self._new_distributed_checkpoint_path("state", name)
