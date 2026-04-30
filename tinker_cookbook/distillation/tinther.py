@@ -4,9 +4,8 @@ Covers the API surface used (directly and transitively) by
 ``tinker_cookbook/distillation/train_on_policy.py`` and
 ``tinker_cookbook/distillation/train_off_policy.py``.
 
-Backed by transformers + peft + torch + accelerate + vllm, with
-FSDP/DeepSpeed/DDP chosen via ``TINTHER_BACKEND``. Multi-GPU launch via
-``accelerate launch`` or ``torchrun``.
+Backed by transformers + peft + torch + accelerate + vllm, with DDP.
+Multi-GPU launch via ``accelerate launch`` or ``torchrun``.
 
 Register as ``tinker`` before importing cookbook modules::
 
@@ -476,6 +475,65 @@ class _TrainerBackend:
     """Owns the training model, optimizer, and tokenizer."""
 
     @staticmethod
+    def _lr_scheduler_enabled() -> bool:
+        return (os.environ.get("TINTHER_LR_SCHEDULER") or "").lower() == "cosine"
+
+    @staticmethod
+    def _resolve_initial_lr() -> float:
+        if not _TrainerBackend._lr_scheduler_enabled():
+            return 1e-5
+        peak = os.environ.get("TINTHER_LR_PEAK")
+        if peak is None:
+            raise TinkerError(
+                "TINTHER_LR_SCHEDULER=cosine requires TINTHER_LR_PEAK (peak learning rate)."
+            )
+        try:
+            return float(peak)
+        except ValueError as e:
+            raise TinkerError(f"TINTHER_LR_PEAK must be a float, got {peak!r}") from e
+
+    @staticmethod
+    def _build_lr_scheduler(optimizer: torch.optim.Optimizer):
+        if not _TrainerBackend._lr_scheduler_enabled():
+            return None
+        total_raw = os.environ.get("TINTHER_LR_TOTAL_STEPS")
+        if total_raw is None:
+            raise TinkerError(
+                "TINTHER_LR_SCHEDULER=cosine requires TINTHER_LR_TOTAL_STEPS "
+                "(total number of optim steps)."
+            )
+        try:
+            total_steps = int(total_raw)
+        except ValueError as e:
+            raise TinkerError(
+                f"TINTHER_LR_TOTAL_STEPS must be an int, got {total_raw!r}"
+            ) from e
+        if total_steps <= 0:
+            raise TinkerError("TINTHER_LR_TOTAL_STEPS must be > 0")
+        warmup_steps = int(os.environ.get("TINTHER_LR_WARMUP_STEPS", "0"))
+        if warmup_steps < 0:
+            raise TinkerError("TINTHER_LR_WARMUP_STEPS must be >= 0")
+        min_lr_ratio = float(os.environ.get("TINTHER_LR_MIN_RATIO", "0.0"))
+        if not 0.0 <= min_lr_ratio <= 1.0:
+            raise TinkerError("TINTHER_LR_MIN_RATIO must be in [0.0, 1.0]")
+
+        from transformers import get_cosine_with_min_lr_schedule_with_warmup
+
+        logger.info(
+            "Enabling transformers cosine LR scheduler: peak=%s total=%d warmup=%d min_ratio=%.4f",
+            optimizer.param_groups[0]["lr"],
+            total_steps,
+            warmup_steps,
+            min_lr_ratio,
+        )
+        return get_cosine_with_min_lr_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_steps,
+            min_lr_rate=min_lr_ratio,
+        )
+
+    @staticmethod
     def _resolve_trainer_attn_implementation() -> tuple[str | None, bool]:
         requested = os.environ.get("TINTHER_TRAINER_ATTN_IMPLEMENTATION")
         if requested == "fa2":
@@ -511,45 +569,8 @@ class _TrainerBackend:
         self._last_backward_outputs: list[dict[str, TensorData]] | None = None
         self._last_backward_metrics: dict[str, float] | None = None
 
-        backend = os.environ.get("TINTHER_BACKEND", "ddp").lower()
         mixed_precision = os.environ.get("TINTHER_MIXED_PRECISION", "bf16")
-        accelerator_kwargs: dict[str, Any] = {"mixed_precision": mixed_precision}
-        if backend == "fsdp":
-            try:
-                from accelerate import FullyShardedDataParallelPlugin
-
-                accelerator_kwargs["fsdp_plugin"] = FullyShardedDataParallelPlugin()
-            except Exception:
-                logger.warning("FSDP requested but plugin unavailable; falling back to DDP")
-        elif backend == "deepspeed":
-            try:
-                from accelerate import DeepSpeedPlugin
-
-                zero_stage = int(os.environ.get("TINTHER_DEEPSPEED_ZERO", "3"))
-                # accelerate's DeepSpeedPlugin requires train_micro_batch_size_per_gpu
-                # even when we feed data one-datum-at-a-time (tinther accumulates
-                # grads manually inside forward_backward_sync). Set minimal config.
-                micro_bs = int(
-                    os.environ.get("TINTHER_DEEPSPEED_MICRO_BS_PER_GPU", "1")
-                )
-                grad_accum = int(
-                    os.environ.get("TINTHER_DEEPSPEED_GRAD_ACCUM", "1")
-                )
-                accelerator_kwargs["deepspeed_plugin"] = DeepSpeedPlugin(
-                    zero_stage=zero_stage,
-                    gradient_accumulation_steps=grad_accum,
-                    hf_ds_config={
-                        "train_micro_batch_size_per_gpu": micro_bs,
-                        "gradient_accumulation_steps": grad_accum,
-                        "zero_optimization": {"stage": zero_stage},
-                        "bf16": {"enabled": mixed_precision == "bf16"},
-                        "fp16": {"enabled": mixed_precision == "fp16"},
-                    },
-                )
-            except Exception:
-                logger.warning("DeepSpeed requested but plugin unavailable; falling back to DDP")
-
-        self.accelerator: Accelerator = Accelerator(**accelerator_kwargs)
+        self.accelerator: Accelerator = Accelerator(mixed_precision=mixed_precision)
         _DIST.ensure_initialized()
 
         # Tokenizer
@@ -628,13 +649,25 @@ class _TrainerBackend:
         else:
             self.model = base
 
-        # Optimizer (params on fresh model; FSDP/DeepSpeed-aware via accelerator.prepare)
+        # Optimizer (params on fresh model; DDP-aware via accelerator.prepare).
+        # When TINTHER_LR_SCHEDULER=cosine, initial lr becomes the scheduler's
+        # base lr (param_group["lr"] at scheduler creation time), so the peak
+        # must be set here — not later in _optim_step_sync.
         trainable = [p for p in self.model.parameters() if p.requires_grad]
+        initial_lr = self._resolve_initial_lr()
         self.optimizer = torch.optim.AdamW(
-            trainable, lr=1e-5, betas=(0.9, 0.95), eps=1e-8
+            trainable, lr=initial_lr, betas=(0.9, 0.95), eps=1e-8
         )
 
-        self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
+        self._lr_scheduler = self._build_lr_scheduler(self.optimizer)
+        if self._lr_scheduler is not None:
+            self.model, self.optimizer, self._lr_scheduler = self.accelerator.prepare(
+                self.model, self.optimizer, self._lr_scheduler
+            )
+        else:
+            self.model, self.optimizer = self.accelerator.prepare(
+                self.model, self.optimizer
+            )
 
         # Optionally restore optimizer state
         if from_state and load_optimizer:
@@ -646,6 +679,15 @@ class _TrainerBackend:
                     )
             except Exception as e:
                 logger.warning(f"Could not restore optimizer state: {e}")
+            if self._lr_scheduler is not None:
+                try:
+                    sched_path = _CheckpointStore.resolve(from_state) / "lr_scheduler.pt"
+                    if sched_path.exists():
+                        self._lr_scheduler.load_state_dict(
+                            torch.load(sched_path, map_location="cpu")
+                        )
+                except Exception as e:
+                    logger.warning(f"Could not restore LR scheduler state: {e}")
 
         self._user_metadata: dict[str, str] = {}
         self._last_sampler_path: str | None = None
@@ -725,6 +767,32 @@ class _TrainerBackend:
             # So logits[:T] align 1-1 with target_tokens (length T).
             targets_t = logits.size(0)
             inputs = {k: v.to_torch().to(device) for k, v in datum.loss_fn_inputs.items()}
+
+
+            # -------------------------------- DEBUG
+            print(f"len(data_D): {len(data_D)}")
+            print({k: tuple(v.shape) for k, v in inputs.items()})
+            # soft-target distillation 디버그 프린트: (N, K) 형태의 target_tokens/weights에서
+            # 각 response 위치별 상위 teacher 분포를 확인한다.
+            _tt, _ww = inputs.get("target_tokens"), inputs.get("weights")
+            if _tt is not None and _ww is not None and _tt.ndim == 2:
+                _N, _K = _tt.shape  # N=시퀀스 길이, K=teacher top-K
+                # weight 합이 0보다 큰 행만 실제 response 위치. 전부 0이면 앞 20개로 fallback.
+                _rows = (_ww.sum(-1) > 0).nonzero(as_tuple=True)[0].tolist() or list(range(min(20, _N)))
+                # 20개 초과면 앞 10 + 뒤 10만 샘플링해서 출력량 제한.
+                _positions = _rows if len(_rows) <= 20 else _rows[:10] + _rows[-10:]
+                print(f"  [N={_N}, K={_K}] showing {len(_positions)} response positions:")
+                for _i, _pos in enumerate(_positions):
+                    # 해당 위치의 K개 (토큰ID, weight) 쌍을 weight 내림차순 상위 5개만.
+                    _pairs = sorted(zip(_tt[_pos].tolist(), _ww[_pos].tolist()), key=lambda x: -x[1])[:5]
+                    print(f"  pos={_pos} (top-5 of {_K}):")
+                    for _tid, _w in _pairs:
+                        print(f"    tok={_tid:>6}  w={_w:.4f}  {self.tokenizer.decode([int(_tid)])!r}")
+                    # 앞 10개 출력 직후 생략 표시.
+                    if _i == 9 and len(_rows) > 20:
+                        print("  .....")
+
+
             # Align any length mismatch by truncating to common length.
             target_len = inputs["target_tokens"].shape[0]
             common = min(targets_t, target_len)
@@ -769,9 +837,13 @@ class _TrainerBackend:
             return await asyncio.to_thread(self._optim_step_sync, adam)
 
     def _optim_step_sync(self, adam: AdamParams) -> OptimStepResponse:
-        # Update LR / betas / eps on the fly (tinker exposes per-step Adam params).
+        # Update betas/eps on the fly (tinker exposes per-step Adam params).
+        # When the cosine scheduler owns LR, ignore adam.learning_rate — the
+        # scheduler sets param_group["lr"] at construction and after each step.
+        scheduler_owns_lr = self._lr_scheduler is not None
         for g in self.optimizer.param_groups:
-            g["lr"] = float(adam.learning_rate)
+            if not scheduler_owns_lr:
+                g["lr"] = float(adam.learning_rate)
             g["betas"] = (float(adam.beta1), float(adam.beta2))
             g["eps"] = float(adam.eps)
 
@@ -785,15 +857,21 @@ class _TrainerBackend:
         grad_norm = float(grad_norm**0.5) if n else 0.0
 
         self.optimizer.step()
+        if self._lr_scheduler is not None:
+            self._lr_scheduler.step()
         self.optimizer.zero_grad(set_to_none=True)
+        effective_lr = float(self.optimizer.param_groups[0]["lr"])
         metrics: dict[str, float] = {
-            "optim/lr": float(adam.learning_rate),
+            "optim/lr": effective_lr,
             "optim/grad_norm": grad_norm,
         }
         if self._last_backward_metrics:
             for k, v in self._last_backward_metrics.items():
                 metrics[f"train/{k}"] = float(v)
         return OptimStepResponse(metrics=metrics)
+
+    async def save_state(self, name: str) -> _SavePath:
+        return await asyncio.to_thread(self._save_state_sync, name)
 
     def _new_distributed_checkpoint_path(
         self, kind: Literal["state", "sampler"], name: str
@@ -805,9 +883,6 @@ class _TrainerBackend:
             raise TinkerError(f"Could not broadcast checkpoint name for {kind}")
         return _CheckpointStore.new_path(kind, name=shared_name)
 
-    async def save_state(self, name: str) -> _SavePath:
-        return await asyncio.to_thread(self._save_state_sync, name)
-
     def _save_state_sync(self, name: str) -> _SavePath:
         path, d = self._new_distributed_checkpoint_path("state", name)
         unwrapped = self.accelerator.unwrap_model(self.model)
@@ -818,6 +893,13 @@ class _TrainerBackend:
                 torch.save(self.optimizer.state_dict(), str(d / "optim.pt"))
             except Exception as e:
                 logger.warning(f"Could not save optimizer state: {e}")
+            if self._lr_scheduler is not None:
+                try:
+                    torch.save(
+                        self._lr_scheduler.state_dict(), str(d / "lr_scheduler.pt")
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not save LR scheduler state: {e}")
             _CheckpointStore.write_meta(
                 path,
                 {
