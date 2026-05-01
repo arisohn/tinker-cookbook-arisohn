@@ -1,0 +1,17 @@
+[project]
+name = "env"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "setuptools>=61.0",
+    "wheel",
+    "packaging",
+    "ninja",
+    "psutil",
+    "numpy",
+    "torch===2.8.0",
+    "flash-attn==2.8.3",
+]
+
+[tool.uv]
+no-build-isolation-package = ["flash-attn"]
