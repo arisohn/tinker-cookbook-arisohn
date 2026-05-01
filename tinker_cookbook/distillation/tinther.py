@@ -742,6 +742,7 @@ class _TrainerBackend:
         else:
             global_batch_size = n_data
 
+        ### MAKE DATA
         token_lists = [datum.model_input.to_ints() for datum in data_D]
         seq_lens = [len(tokens) for tokens in token_lists]
         max_seq_len = max(seq_lens)
@@ -754,9 +755,12 @@ class _TrainerBackend:
         attention_mask = torch.zeros((n_data, max_seq_len), dtype=torch.long, device=device)
         for i_datum, tokens in enumerate(token_lists):
             seq_len = len(tokens)
+            # SKELETON 
             input_ids[i_datum, :seq_len] = torch.tensor(tokens, dtype=torch.long, device=device)
             attention_mask[i_datum, :seq_len] = 1
 
+        ### FORWARD
+        # SKELETON
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
         batch_logits = outputs.logits
 
@@ -800,6 +804,9 @@ class _TrainerBackend:
             for k, v in list(inputs.items()):
                 if v.ndim >= 1 and v.shape[0] >= common:
                     inputs[k] = v[:common]
+
+            ### LOSS
+            # SKELETON
             loss, per_pos_lp, metrics = loss_impl(logits, inputs, loss_fn_config)
             local_loss_sum = local_loss_sum + loss
             loss_fn_outputs.append({"logprobs": TensorData.from_torch(per_pos_lp)})
@@ -811,6 +818,8 @@ class _TrainerBackend:
         else:
             total_loss = local_loss_sum / n_data
 
+        ### BACKWARD
+        # SKELETON
         self.accelerator.backward(total_loss)
 
         if use_global_batch_scaling and local_metric_sums:
