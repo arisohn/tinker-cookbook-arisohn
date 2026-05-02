@@ -16,3 +16,4 @@ dependencies = [
 
 [tool.uv]
 no-build-isolation-package = ["flash-attn"]
+extra-build-dependencies = { flash-attn = ["torch===2.8.0", "setuptools", "wheel", "packaging", "ninja", "psutil"] }
