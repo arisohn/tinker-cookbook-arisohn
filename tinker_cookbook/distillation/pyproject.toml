@@ -9,7 +9,7 @@ dependencies = [
     "ninja",
     "psutil",
     "numpy",
-    "torch===2.8.0",
+    "torch==2.8.0",
     "flash-attn==2.8.3",
     "transformers==4.56.0"
 ]
