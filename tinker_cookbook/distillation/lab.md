@@ -25,3 +25,11 @@ ultrathink
    → per_device=1, grad_accum=8 → effective 8 (Recommended)
  ● Sample packing(여러 짧은 샘플을 8192까지 이어붙임)을 사용할까요?
    → Packing 끄기 (Recommended)
+
+
+ ● 8192 토큰을 초과하는 샘플(추론 트레이스로 긴 샘플이 상당수)은 어떻게 처리할까요?
+   → 제거 (filter out) (Recommended)
+ ● Liger Kernel(Qwen3 전용 삼각형 커널/RMSNorm/RoPE 수정) 사용 여부?
+   → 사용 (Recommended)
+ ● 체크포인트 저장 전략은?
+   → 최종 체크포인트만
