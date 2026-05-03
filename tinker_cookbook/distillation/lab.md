@@ -10,8 +10,9 @@ ultrathink
 - 학습코드 학습결과 및 학습로그는 /workspace/trl 에 저장해주세요.
 - flash attention을 사용하세요
 - full fine tunning을 하세요.
-- max length는 8192 입니다.
+- max sequence length는 8192 입니다.
 - precision은 bf16을 사용해주세요.
+- linger kenrnel을 사용하지 않습니다.
 - 유저의 결정이 필요한 사항들을 유저에게 문의하세요.
 
 
