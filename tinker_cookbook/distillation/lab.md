@@ -7,3 +7,4 @@ ultrathink
 - loss rate는 5e-5 로 scheduler는 cosine을 사용하세요.
 - 3 epoch 학습하세요.
 - 학습코드 학습결과 및 학습로그는 /workspace/trl 에 저장해주세요.
+- 유저의 결정이 필요한 사항들을 유저에게 문의하세요.
