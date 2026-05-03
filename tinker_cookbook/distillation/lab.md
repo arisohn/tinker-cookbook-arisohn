@@ -11,6 +11,7 @@ ultrathink
 - flash attention을 사용하세요
 - full fine tunning을 하세요.
 - max length는 8192 입니다.
+- precision은 bf16을 사용해주세요.
 - 유저의 결정이 필요한 사항들을 유저에게 문의하세요.
 
 
