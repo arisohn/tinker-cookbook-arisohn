@@ -148,7 +148,24 @@ class TensorData:
         return cls(data=arr, dtype=str(arr.dtype), shape=tuple(arr.shape))
 
     def to_torch(self) -> torch.Tensor:
-        return torch.from_numpy(np.asarray(self.data))
+        arr = np.asarray(self.data)
+        # Honor the declared dtype (cookbook builds TensorData from Python lists
+        # with dtype="float32" / "int64"; numpy would otherwise infer float64
+        # from Python floats and break dtype-strict ops like Tensor.dot).
+        if self.dtype:
+            try:
+                target = np.dtype(self.dtype)
+            except TypeError:
+                target = None
+            if target is not None and arr.dtype != target:
+                arr = arr.astype(target)
+        return torch.from_numpy(arr)
+
+    def tolist(self) -> list:
+        """Mirror tinker.TensorData.tolist() — flatten to a nested Python list."""
+        if isinstance(self.data, list):
+            return list(self.data)
+        return np.asarray(self.data).tolist()
 
 
 @dataclass
@@ -493,6 +510,47 @@ class _TrainerBackend:
             raise TinkerError(f"TINTHER_LR_PEAK must be a float, got {peak!r}") from e
 
     @staticmethod
+    def _resolve_optim_kwargs() -> dict[str, Any]:
+        """Read optional AdamW knobs from the environment.
+
+        TINTHER_WEIGHT_DECAY: AdamW weight_decay (default 0.01 — PyTorch default).
+        TINTHER_OPTIM_FUSED: enable fused AdamW (CUDA-only). Truthy strings: 1/true/yes.
+        """
+        kwargs: dict[str, Any] = {}
+        wd_raw = os.environ.get("TINTHER_WEIGHT_DECAY")
+        if wd_raw is not None and wd_raw != "":
+            try:
+                kwargs["weight_decay"] = float(wd_raw)
+            except ValueError as e:
+                raise TinkerError(
+                    f"TINTHER_WEIGHT_DECAY must be a float, got {wd_raw!r}"
+                ) from e
+        if (os.environ.get("TINTHER_OPTIM_FUSED") or "").lower() in ("1", "true", "yes"):
+            if torch.cuda.is_available():
+                kwargs["fused"] = True
+            else:
+                logger.warning(
+                    "TINTHER_OPTIM_FUSED requested but CUDA is unavailable; ignoring."
+                )
+        return kwargs
+
+    @staticmethod
+    def _resolve_max_grad_norm() -> float | None:
+        """TINTHER_MAX_GRAD_NORM: clip gradients to this L2 norm before optim step."""
+        raw = os.environ.get("TINTHER_MAX_GRAD_NORM")
+        if raw is None or raw == "":
+            return None
+        try:
+            value = float(raw)
+        except ValueError as e:
+            raise TinkerError(
+                f"TINTHER_MAX_GRAD_NORM must be a float, got {raw!r}"
+            ) from e
+        if value <= 0:
+            raise TinkerError("TINTHER_MAX_GRAD_NORM must be > 0")
+        return value
+
+    @staticmethod
     def _build_lr_scheduler(optimizer: torch.optim.Optimizer):
         if not _TrainerBackend._lr_scheduler_enabled():
             return None
@@ -517,7 +575,13 @@ class _TrainerBackend:
         if not 0.0 <= min_lr_ratio <= 1.0:
             raise TinkerError("TINTHER_LR_MIN_RATIO must be in [0.0, 1.0]")
 
-        from transformers import get_cosine_with_min_lr_schedule_with_warmup
+        try:
+            from transformers import get_cosine_with_min_lr_schedule_with_warmup
+        except ImportError:
+            # transformers 4.56.0 doesn't re-export this at the top level.
+            from transformers.optimization import (
+                get_cosine_with_min_lr_schedule_with_warmup,
+            )
 
         logger.info(
             "Enabling transformers cosine LR scheduler: peak=%s total=%d warmup=%d min_ratio=%.4f",
@@ -655,9 +719,11 @@ class _TrainerBackend:
         # must be set here — not later in _optim_step_sync.
         trainable = [p for p in self.model.parameters() if p.requires_grad]
         initial_lr = self._resolve_initial_lr()
+        optim_kwargs = self._resolve_optim_kwargs()
         self.optimizer = torch.optim.AdamW(
-            trainable, lr=initial_lr, betas=(0.9, 0.95), eps=1e-8
+            trainable, lr=initial_lr, betas=(0.9, 0.95), eps=1e-8, **optim_kwargs
         )
+        self._max_grad_norm = self._resolve_max_grad_norm()
 
         self._lr_scheduler = self._build_lr_scheduler(self.optimizer)
         if self._lr_scheduler is not None:
@@ -864,6 +930,11 @@ class _TrainerBackend:
                 grad_norm += float(p.grad.detach().norm(2).item()) ** 2
                 n += 1
         grad_norm = float(grad_norm**0.5) if n else 0.0
+
+        if self._max_grad_norm is not None:
+            self.accelerator.clip_grad_norm_(
+                self.model.parameters(), self._max_grad_norm
+            )
 
         self.optimizer.step()
         if self._lr_scheduler is not None:
@@ -1760,11 +1831,22 @@ class ServiceClient:
 
     async def create_lora_training_client_async(
         self,
-        model_name: str,
-        rank: int,
+        model_name: str | None = None,
+        rank: int | None = None,
         user_metadata: dict[str, str] | None = None,
+        *,
+        base_model: str | None = None,
     ) -> TrainingClient:
-        backend = await asyncio.to_thread(_TrainerBackend, model_name, rank, None, False)
+        # Real tinker uses ``base_model=`` as the kwarg name; the cookbook's
+        # ``supervised/train.py`` calls us with that name. Accept either.
+        resolved_model = base_model if base_model is not None else model_name
+        if resolved_model is None:
+            raise TinkerError(
+                "create_lora_training_client_async requires `model_name` or `base_model`"
+            )
+        if rank is None:
+            raise TinkerError("create_lora_training_client_async requires `rank`")
+        backend = await asyncio.to_thread(_TrainerBackend, resolved_model, rank, None, False)
         backend.set_user_metadata(user_metadata)
         return TrainingClient(backend)
 
@@ -1854,8 +1936,25 @@ def _build_types_module() -> _types_module.ModuleType:
 types = _build_types_module()
 
 
+def _build_lib_module() -> _types_module.ModuleType:
+    """Build a stub for ``tinker.lib`` and ``tinker.lib.public_interfaces``.
+
+    The cookbook's ``supervised/train.py`` imports ``APIFuture`` from
+    ``tinker.lib.public_interfaces``. We expose the same symbol our flat
+    tinther module already defines.
+    """
+    lib_mod = _types_module.ModuleType("tinker.lib")
+    public_interfaces_mod = _types_module.ModuleType("tinker.lib.public_interfaces")
+    public_interfaces_mod.APIFuture = APIFuture
+    lib_mod.public_interfaces = public_interfaces_mod
+    return lib_mod
+
+
+lib = _build_lib_module()
+
+
 def install_as_tinker() -> None:
-    """Register this module as ``tinker`` / ``tinker.types`` in sys.modules.
+    """Register this module as ``tinker`` / ``tinker.types`` / ``tinker.lib``.
 
     Call this once, before importing any ``tinker_cookbook`` module, so
     every downstream ``import tinker`` resolves to ``tinther``.
@@ -1865,6 +1964,8 @@ def install_as_tinker() -> None:
     sys.modules["tinker.types"] = types
     sys.modules["tinker.types.tensor_data"] = types.tensor_data  # type: ignore[attr-defined]
     sys.modules["tinker.types.image_chunk"] = types.image_chunk  # type: ignore[attr-defined]
+    sys.modules["tinker.lib"] = lib
+    sys.modules["tinker.lib.public_interfaces"] = lib.public_interfaces  # type: ignore[attr-defined]
 
 
 __all__ = [

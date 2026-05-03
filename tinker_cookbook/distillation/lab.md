@@ -1,7 +1,7 @@
 ultrathink
 
 # LLM 모델 SFT fine-tuning
-- /workspace/tinker-cookbook-arisohn/tinker_cookbook/distillation.venv 환경을 사용하세요.
+- /workspace/tinker-cookbook-arisohn/tinker_cookbook/distillation/.venv 환경을 사용하세요.
 - 학습데이터는 /workspace/datasets--open-thoughts--OpenThoughts3-1.2M-shuffle-1k 를 사용하세요.
 - 학습모델은 /workspace/models--Qwen--Qwen3-8B-Base 를 사용하세요.
 - huggingface trl 라이브러리를 사용하세요.
@@ -34,3 +34,18 @@ ultrathink
    → 사용 (Recommended)
  ● 체크포인트 저장 전략은?
    → 최종 체크포인트만
+
+
+
+
+ultrathink
+
+# tinther.py 를 사용하는 sft fine-tuning 코드 작성
+- /workspace/tinker-cookbook-arisohn/tinker_cookbook/distillation/.venv 환경을 사용하세요.
+- /workspace/tinker-cookbook-arisohn/tinker_cookbook/distillation/train_off_policy_tinther.py 을 수정하여 /workspace/tinker-cookbook-arisohn/trl/train_sft.py 처럼 sft fine tuning 학습하는 코드로 작성해주세요. 
+- 파일명은 /workspace/tinker-cookbook-arisohn/tinker_cookbook/distillation/train_sft_tinther.py 로 작성해주세요.
+- /workspace/tinker-cookbook-arisohn/tinker_cookbook/distillation/train_sft_tinther.py 는 /workspace/tinker-cookbook-arisohn/tinker_cookbook/distillation/tinther.py를 사용하는 코드로 작성해주세요.
+- 학습데이터는 /workspace/datasets--open-thoughts--OpenThoughts3-1.2M-shuffle-1k 를 사용하세요.
+- 학습모델은 /workspace/models--Qwen--Qwen3-8B-Base 를 사용하세요.
+- 파라미터는 /workspace/tinker-cookbook-arisohn/trl/train_sft.py 따라 작성해주세요.
+- 유저의 결정이 필요한 사항들을 유저에게 문의하세요.
