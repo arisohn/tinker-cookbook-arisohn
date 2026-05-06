@@ -491,18 +491,33 @@ _LossFns.DISPATCH = {
 class _TrainerBackend:
     """Owns the training model, optimizer, and tokenizer."""
 
+    _SUPPORTED_LR_SCHEDULERS = ("cosine", "linear")
+
+    @staticmethod
+    def _lr_scheduler_kind() -> str | None:
+        raw = (os.environ.get("TINTHER_LR_SCHEDULER") or "").lower()
+        if raw == "":
+            return None
+        if raw not in _TrainerBackend._SUPPORTED_LR_SCHEDULERS:
+            raise TinkerError(
+                f"TINTHER_LR_SCHEDULER={raw!r} not supported; "
+                f"expected one of {_TrainerBackend._SUPPORTED_LR_SCHEDULERS}."
+            )
+        return raw
+
     @staticmethod
     def _lr_scheduler_enabled() -> bool:
-        return (os.environ.get("TINTHER_LR_SCHEDULER") or "").lower() == "cosine"
+        return _TrainerBackend._lr_scheduler_kind() is not None
 
     @staticmethod
     def _resolve_initial_lr() -> float:
-        if not _TrainerBackend._lr_scheduler_enabled():
+        kind = _TrainerBackend._lr_scheduler_kind()
+        if kind is None:
             return 1e-5
         peak = os.environ.get("TINTHER_LR_PEAK")
         if peak is None:
             raise TinkerError(
-                "TINTHER_LR_SCHEDULER=cosine requires TINTHER_LR_PEAK (peak learning rate)."
+                f"TINTHER_LR_SCHEDULER={kind} requires TINTHER_LR_PEAK (peak learning rate)."
             )
         try:
             return float(peak)
@@ -552,12 +567,13 @@ class _TrainerBackend:
 
     @staticmethod
     def _build_lr_scheduler(optimizer: torch.optim.Optimizer):
-        if not _TrainerBackend._lr_scheduler_enabled():
+        kind = _TrainerBackend._lr_scheduler_kind()
+        if kind is None:
             return None
         total_raw = os.environ.get("TINTHER_LR_TOTAL_STEPS")
         if total_raw is None:
             raise TinkerError(
-                "TINTHER_LR_SCHEDULER=cosine requires TINTHER_LR_TOTAL_STEPS "
+                f"TINTHER_LR_SCHEDULER={kind} requires TINTHER_LR_TOTAL_STEPS "
                 "(total number of optim steps)."
             )
         try:
@@ -575,27 +591,49 @@ class _TrainerBackend:
         if not 0.0 <= min_lr_ratio <= 1.0:
             raise TinkerError("TINTHER_LR_MIN_RATIO must be in [0.0, 1.0]")
 
-        try:
-            from transformers import get_cosine_with_min_lr_schedule_with_warmup
-        except ImportError:
-            # transformers 4.56.0 doesn't re-export this at the top level.
-            from transformers.optimization import (
-                get_cosine_with_min_lr_schedule_with_warmup,
+        if kind == "cosine":
+            try:
+                from transformers import get_cosine_with_min_lr_schedule_with_warmup
+            except ImportError:
+                # transformers 4.56.0 doesn't re-export this at the top level.
+                from transformers.optimization import (
+                    get_cosine_with_min_lr_schedule_with_warmup,
+                )
+
+            logger.info(
+                "Enabling transformers cosine LR scheduler: peak=%s total=%d warmup=%d min_ratio=%.4f",
+                optimizer.param_groups[0]["lr"],
+                total_steps,
+                warmup_steps,
+                min_lr_ratio,
+            )
+            return get_cosine_with_min_lr_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=warmup_steps,
+                num_training_steps=total_steps,
+                min_lr_rate=min_lr_ratio,
             )
 
+        # kind == "linear": warmup linearly to peak, then linearly decay to
+        # peak * min_lr_ratio over the remaining steps.
+        peak_lr = optimizer.param_groups[0]["lr"]
+
+        def linear_lr_lambda(current_step: int) -> float:
+            if current_step < warmup_steps:
+                return float(current_step) / float(max(1, warmup_steps))
+            decay_steps = max(1, total_steps - warmup_steps)
+            progress = (current_step - warmup_steps) / decay_steps
+            progress = min(max(progress, 0.0), 1.0)
+            return max(min_lr_ratio, 1.0 - (1.0 - min_lr_ratio) * progress)
+
         logger.info(
-            "Enabling transformers cosine LR scheduler: peak=%s total=%d warmup=%d min_ratio=%.4f",
-            optimizer.param_groups[0]["lr"],
+            "Enabling linear LR scheduler: peak=%s total=%d warmup=%d min_ratio=%.4f",
+            peak_lr,
             total_steps,
             warmup_steps,
             min_lr_ratio,
         )
-        return get_cosine_with_min_lr_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=total_steps,
-            min_lr_rate=min_lr_ratio,
-        )
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=linear_lr_lambda)
 
     @staticmethod
     def _resolve_trainer_attn_implementation() -> tuple[str | None, bool]:
@@ -821,12 +859,12 @@ class _TrainerBackend:
         attention_mask = torch.zeros((n_data, max_seq_len), dtype=torch.long, device=device)
         for i_datum, tokens in enumerate(token_lists):
             seq_len = len(tokens)
-            # SKELETON 
+            # SKELETON
             input_ids[i_datum, :seq_len] = torch.tensor(tokens, dtype=torch.long, device=device)
             attention_mask[i_datum, :seq_len] = 1
 
-        ### FORWARD
         # SKELETON
+        ## FORWARD
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
         batch_logits = outputs.logits
 
@@ -871,8 +909,8 @@ class _TrainerBackend:
                 if v.ndim >= 1 and v.shape[0] >= common:
                     inputs[k] = v[:common]
 
-            ### LOSS
             # SKELETON
+            ## LOSS
             loss, per_pos_lp, metrics = loss_impl(logits, inputs, loss_fn_config)
             local_loss_sum = local_loss_sum + loss
             loss_fn_outputs.append({"logprobs": TensorData.from_torch(per_pos_lp)})
@@ -884,8 +922,8 @@ class _TrainerBackend:
         else:
             total_loss = local_loss_sum / n_data
 
-        ### BACKWARD
         # SKELETON
+        ## BACKWARD
         self.accelerator.backward(total_loss)
 
         if use_global_batch_scaling and local_metric_sums:
