@@ -49,3 +49,17 @@ ultrathink
 - 학습모델은 /workspace/models--Qwen--Qwen3-8B-Base 를 사용하세요.
 - 파라미터는 /workspace/tinker-cookbook-arisohn/trl/train_sft.py 따라 작성해주세요.
 - 유저의 결정이 필요한 사항들을 유저에게 문의하세요.
+
+
+ultrathink
+- train_off_policy_tinther.py 와 train_on_policy_tinther.py 을 single / multi gpu 에서 동작하도록 tinther.py 를 수정하고 싶습니다.
+- tinther.py 만 코드를 수정합니다. 다른 코드는 수정하지 않습니다.
+- multi gpu 는 DDP만 사용합니다.
+- studuent model이 DDP를 활용하여 학습속도를 개선하고 싶습니다.
+- DDP 학습속도 개선을 위해 forward_backward()의 batch를 어떻게 처리할까요? tinther 내부에서 rank별 slicing 
+- Off-policy 학습에서 teacher의 logprobs/sample 요청을 multi-GPU에서 어떻게 분배할까요? 각 rank가 자기 batch slice의 teacher 요청만
+- Multi-GPU 실행 launcher는 무엇을 표준으로 할까요? torchrun --nproc_per_node=N
+- forward_backward 내부에서 batch를 rank별로 어떻게 slice할까요? Strided
+- On-policy의 student in-process sampler (vLLM/HF)는 multi-GPU에서 어떻게 동작시킬까요?  Per-rank 독립
+- 결정이 필요한 사항은 유저에게 문의하세요.
+/plan 
