@@ -70,6 +70,7 @@ ultrathink
 - train_off_policy_tinther.py 와 train_on_policy_tinther.py 의 student 학습을 DDP를 사용하여 single, multi GPU 에서 동작하도록 tinther.py 을 수정하고 싶습니다.
 - tinther.py 만 수정해주세요.
 - studnent가 DDP를 사용하여 학습합니다.
+- *.md 파일은 참고하지 마세요.
 - 유저의 결정이 필요한 사항들을 유저에게 문의하세요.
-
+/plan
 
