@@ -5,7 +5,38 @@ Covers the API surface used (directly and transitively) by
 ``tinker_cookbook/distillation/train_off_policy.py``.
 
 Backed by transformers + peft + torch + accelerate + vllm, with DDP.
-Multi-GPU launch via ``accelerate launch`` or ``torchrun``.
+
+Launch
+------
+
+Single GPU (no distributed init)::
+
+    python tinker_cookbook/distillation/train_off_policy_tinther.py <chz args...>
+
+Multi-GPU (DDP) via accelerate::
+
+    accelerate launch --num_processes=$NGPUS \\
+        tinker_cookbook/distillation/train_off_policy_tinther.py <chz args...>
+
+DDP env vars
+------------
+
+``TINTHER_DDP_BATCH_SHARD`` controls how the student batch is split across
+ranks inside ``_TrainerBackend.forward_backward``:
+
+* ``stride`` (default): rank R processes ``data_D[R::world_size]``. Use for
+  off-policy distillation, where every rank receives the *same* deterministic
+  batch from the cookbook. Each rank does ``1/world_size`` of the student
+  forward/backward; DDP all-reduces gradients to recover the full-batch
+  gradient. (Teacher logprob fetches are still duplicated ``world_size``× —
+  the cookbook drives them per rank and tinther doesn't dedupe.)
+* ``none``: no slicing — each rank does forward/backward on its full local
+  ``data_D``. Use for on-policy distillation, where each rank's student
+  sampler emits independent trajectories and the per-rank ``data_D`` already
+  differs.
+
+When ``world_size <= 1`` (i.e. ``python script.py`` with no torchrun /
+accelerate), this env var has no effect.
 
 Register as ``tinker`` before importing cookbook modules::
 
@@ -264,6 +295,10 @@ class _DistEnv:
             self._initialized = True
             return
         if not torch.distributed.is_initialized():
+            # Pin the per-rank GPU before NCCL init so subsequent model loads
+            # land on the right device (defensive — Accelerator() does this too).
+            if torch.cuda.is_available():
+                torch.cuda.set_device(self.local_rank)
             torch.distributed.init_process_group(backend="nccl")
         if self._gloo_group is None:
             self._gloo_group = torch.distributed.new_group(backend="gloo")
@@ -307,6 +342,31 @@ def is_main_process() -> bool:
 def barrier() -> None:
     _DIST.ensure_initialized()
     _DIST.barrier()
+
+
+def _resolve_shard_mode() -> str:
+    """Per-rank batch-sharding mode for ``_TrainerBackend.forward_backward``.
+
+    Reads ``TINTHER_DDP_BATCH_SHARD`` from the environment.
+
+    * ``stride`` (default): rank R processes ``data_D[R::world_size]``. Use
+      when every rank receives the same input batch (off-policy distillation,
+      where the cookbook builds a deterministic batch on each rank).
+    * ``none``: no slicing — each rank processes its full local ``data_D``.
+      Use when each rank already constructs its own batch (on-policy
+      distillation, where each rank's student sampler emits independent
+      trajectories).
+
+    No effect on single-GPU runs (``world_size <= 1``); the slicing branch is
+    skipped regardless of this value.
+    """
+    raw = (os.environ.get("TINTHER_DDP_BATCH_SHARD") or "stride").lower()
+    if raw not in ("stride", "none"):
+        raise TinkerError(
+            f"TINTHER_DDP_BATCH_SHARD={raw!r} not supported; "
+            "expected 'stride' or 'none'."
+        )
+    return raw
 
 
 def _cache_root() -> Path:
@@ -831,20 +891,41 @@ class _TrainerBackend:
         loss_fn_outputs: list[dict[str, TensorData]] = []
         local_loss_sum = torch.zeros((), device=device)
         local_metric_sums: dict[str, float] = {}
-        n_data = len(data_D)
-        if n_data == 0:
+        full_n_data = len(data_D)
+        if full_n_data == 0:
+            # Symmetric across all ranks — no collective fires, so safe under DDP.
             self._last_backward_outputs = []
             self._last_backward_metrics = {}
             return ForwardBackwardOutput(loss_fn_outputs=[], metrics={})
 
-        global_batch_size = (loss_fn_config or {}).get("global_batch_size")
-        use_global_batch_scaling = global_batch_size is not None
-        if use_global_batch_scaling:
-            global_batch_size = int(global_batch_size)
+        # Per-rank strided slice for DDP. Skip when full_n_data < world_size to
+        # avoid empty-shard NCCL hangs; in that pathological case every rank
+        # redundantly processes the full batch (correct, just no speedup).
+        shard_mode = _resolve_shard_mode()
+        sliced = (
+            _DIST.world_size > 1
+            and shard_mode == "stride"
+            and full_n_data >= _DIST.world_size
+        )
+        if sliced:
+            data_D = data_D[_DIST.rank :: _DIST.world_size]
+        n_data = len(data_D)
+
+        # Resolve global_batch_size: caller wins, then auto-inject when sliced
+        # so the existing `world_size / global_batch_size` scaling produces the
+        # correct DDP-averaged gradient without cookbook changes.
+        config_gbs = (loss_fn_config or {}).get("global_batch_size")
+        if config_gbs is not None:
+            global_batch_size = int(config_gbs)
             if global_batch_size <= 0:
                 raise TinkerError("loss_fn_config.global_batch_size must be positive")
+            use_global_batch_scaling = True
+        elif sliced:
+            global_batch_size = full_n_data
+            use_global_batch_scaling = True
         else:
             global_batch_size = n_data
+            use_global_batch_scaling = False
 
         ### MAKE DATA
         token_lists = [datum.model_input.to_ints() for datum in data_D]
@@ -875,31 +956,6 @@ class _TrainerBackend:
             # So logits[:T] align 1-1 with target_tokens (length T).
             targets_t = logits.size(0)
             inputs = {k: v.to_torch().to(device) for k, v in datum.loss_fn_inputs.items()}
-
-
-            # -------------------------------- DEBUG
-            print(f"len(data_D): {len(data_D)}")
-            print({k: tuple(v.shape) for k, v in inputs.items()})
-            # soft-target distillation 디버그 프린트: (N, K) 형태의 target_tokens/weights에서
-            # 각 response 위치별 상위 teacher 분포를 확인한다.
-            _tt, _ww = inputs.get("target_tokens"), inputs.get("weights")
-            if _tt is not None and _ww is not None and _tt.ndim == 2:
-                _N, _K = _tt.shape  # N=시퀀스 길이, K=teacher top-K
-                # weight 합이 0보다 큰 행만 실제 response 위치. 전부 0이면 앞 20개로 fallback.
-                _rows = (_ww.sum(-1) > 0).nonzero(as_tuple=True)[0].tolist() or list(range(min(20, _N)))
-                # 20개 초과면 앞 10 + 뒤 10만 샘플링해서 출력량 제한.
-                _positions = _rows if len(_rows) <= 20 else _rows[:10] + _rows[-10:]
-                print(f"  [N={_N}, K={_K}] showing {len(_positions)} response positions:")
-                for _i, _pos in enumerate(_positions):
-                    # 해당 위치의 K개 (토큰ID, weight) 쌍을 weight 내림차순 상위 5개만.
-                    _pairs = sorted(zip(_tt[_pos].tolist(), _ww[_pos].tolist()), key=lambda x: -x[1])[:5]
-                    print(f"  pos={_pos} (top-5 of {_K}):")
-                    for _tid, _w in _pairs:
-                        print(f"    tok={_tid:>6}  w={_w:.4f}  {self.tokenizer.decode([int(_tid)])!r}")
-                    # 앞 10개 출력 직후 생략 표시.
-                    if _i == 9 and len(_rows) > 20:
-                        print("  .....")
-
 
             # Align any length mismatch by truncating to common length.
             target_len = inputs["target_tokens"].shape[0]
@@ -936,6 +992,26 @@ class _TrainerBackend:
             _DIST.all_reduce_tensor(metric_tensor)
             aggregated = {
                 name: float(metric_tensor[i].item() / global_batch_size)
+                for i, name in enumerate(metric_names)
+            }
+        elif (
+            _DIST.world_size > 1
+            and shard_mode == "none"
+            and local_metric_sums
+        ):
+            # `none` mode: each rank has its own data_D. Report the cross-rank
+            # mean of per-rank means so logged metrics don't depend on which
+            # rank reads them. Assumes every rank has non-empty data_D, which
+            # is the on-policy invariant in train_on_policy.py.
+            metric_names = sorted(local_metric_sums)
+            metric_tensor = torch.tensor(
+                [local_metric_sums[name] / n_data for name in metric_names],
+                device=device,
+                dtype=torch.float64,
+            )
+            _DIST.all_reduce_tensor(metric_tensor)
+            aggregated = {
+                name: float(metric_tensor[i].item() / _DIST.world_size)
                 for i, name in enumerate(metric_names)
             }
         else:
@@ -1080,6 +1156,10 @@ class _SamplerBackend:
     """
 
     def __init__(self, model_ref: str):
+        # Under DDP, every rank instantiates its own _SamplerBackend (vLLM/HF)
+        # on its local GPU, so per-node sampler memory scales linearly with
+        # world_size. Size TINTHER_SAMPLER_GPU_MEM (default 0.45) and
+        # TINTHER_SAMPLER_TP (default 1) accordingly.
         self.model_ref = model_ref
         self._llm = None
         self._tokenizer = None
