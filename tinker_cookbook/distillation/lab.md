@@ -74,3 +74,17 @@ ultrathink
 - 유저의 결정이 필요한 사항들을 유저에게 문의하세요.
 /plan
 
+
+ultrathink
+- train_off_policy_tinther.py 와 train_on_policy_tinther.py 의 student 학습을 DDP를 사용하여 single, multi GPU 에서 동작하도록 tinther.py 을 수정하고 싶습니다.
+- tinther.py 만 수정해주세요.
+- data sharding을 사용해서 속도를 올릴수 있는 코드를 찾아주세요.
+- *.md 파일은 참고하지 마세요.
+- 유저의 결정이 필요한 사항들을 유저에게 문의하세요.
+
+Teacher 작업도 샤딩: _HTTPSamplerBackend에 DDP 인지 로직 추가. 각 rank가 자기 shard의 teacher 호출만 수행. off-policy의 _collect_topk_batch와 on-policy의 incorporate_kl_penalty에서 적용. teacher 호출을 ~world_size으로 줄여 실질적 속도 향상.
+
+all-gather 넣음: metric 완전 정확 (권장) 각 rank가 자기 shard만 teacher 호출하고, 결과를 all-gather로 공유. on-policy의 teacher_kl 같은 metric이 전체 batch 기준으로 정확하게 계산됨. 
+
+/plan
+
