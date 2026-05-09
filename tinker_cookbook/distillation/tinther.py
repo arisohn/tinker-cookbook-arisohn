@@ -314,23 +314,6 @@ class _DistEnv:
 _DIST = _DistEnv()
 
 
-def get_rank() -> int:
-    return _DIST.rank
-
-
-def get_world_size() -> int:
-    return _DIST.world_size
-
-
-def is_main_process() -> bool:
-    return _DIST.is_main
-
-
-def barrier() -> None:
-    _DIST.ensure_initialized()
-    _DIST.barrier()
-
-
 _DATA_SHARDING_FALSY = {"", "none", "off", "0", "false", "no"}
 _DATA_SHARDING_VALID = {"shard", "replica"}
 
@@ -735,10 +718,6 @@ class _TrainerBackend:
         return raw
 
     @staticmethod
-    def _lr_scheduler_enabled() -> bool:
-        return _TrainerBackend._lr_scheduler_kind() is not None
-
-    @staticmethod
     def _resolve_initial_lr() -> float:
         kind = _TrainerBackend._lr_scheduler_kind()
         if kind is None:
@@ -914,7 +893,6 @@ class _TrainerBackend:
         self.model_name = model_name
         self.lora_rank = lora_rank
         self._lock = asyncio.Lock()
-        self._last_backward_outputs: list[dict[str, TensorData]] | None = None
         self._last_backward_metrics: dict[str, float] | None = None
 
         mixed_precision = os.environ.get("TINTHER_MIXED_PRECISION", "bf16")
@@ -1064,7 +1042,6 @@ class _TrainerBackend:
                     logger.warning(f"Could not restore LR scheduler state: {e}")
 
         self._user_metadata: dict[str, str] = {}
-        self._last_sampler_path: str | None = None
 
     # ---- Public-ish methods called by TrainingClient -------------------
 
@@ -1191,7 +1168,6 @@ class _TrainerBackend:
         local_metric_sums: dict[str, float] = {}
         n_data = len(data_D)
         if n_data == 0:
-            self._last_backward_outputs = []
             self._last_backward_metrics = {}
             return ForwardBackwardOutput(loss_fn_outputs=[], metrics={})
 
@@ -1329,7 +1305,6 @@ class _TrainerBackend:
         else:
             aggregated = {k: v / n_data for k, v in local_metric_sums.items()}
 
-        self._last_backward_outputs = loss_fn_outputs
         self._last_backward_metrics = aggregated
         return ForwardBackwardOutput(loss_fn_outputs=loss_fn_outputs, metrics=aggregated)
 
@@ -1454,7 +1429,6 @@ class _TrainerBackend:
                 },
             )
         _DIST.barrier()
-        self._last_sampler_path = path
         return _SavePath(path=path)
 
 
@@ -2477,10 +2451,6 @@ __all__ = [
     "TinkerError",
     "TrainingClient",
     "_HTTPSamplerBackend",
-    "barrier",
-    "get_rank",
-    "get_world_size",
     "install_as_tinker",
-    "is_main_process",
     "types",
 ]
