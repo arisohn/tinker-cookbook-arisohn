@@ -88,3 +88,42 @@ all-gather 넣음: metric 완전 정확 (권장) 각 rank가 자기 shard만 tea
 
 /plan
 
+
+
+
+ultrathink
+- train_off_policy_tinther.py 와 train_on_policy_tinther.py 의 teacher 작업을 DDP를 사용하여 single, multi GPU 에서 동작하도록 tinther.py 을 수정하고 싶습니다.
+- tinther.py 만 수정해주세요.
+- *.md 파일은 참고하지 마세요.
+- 유저의 결정이 필요한 사항들을 유저에게 문의하세요.
+/plan
+
+
+
+
+ultrathink
+- DDP를 사용하여 train_off_policy_tinther.py 와 train_on_policy_tinther.py 를 실행할때, teacher 를 사용하여 inference 하는 부분을 data sharding을 적용할수 있을까요?
+- tinther.py 만 수정해주세요.
+/plan
+
+
+ultrathink
+- DDP를 사용하여 train_off_policy_tinther.py 와 train_on_policy_tinther.py 를 실행합니다.
+- on policy, off policy 각각에서 teacher infernece 에 data sharding 을 적용하여 속도를 빠르게 할수 있을까요?
+- tinther.py 만 수정해주세요.
+- *.md 파일은 참고하지 마세요.
+- on policy 는 TINTHER_DATA_SHARDING=replica
+- on policy 는 각 rank가 이미 다른 데이터(자기 rollouts)에 대해 teacher inference를 수행하므로 redundancy가 없습니다. 변경 없음 -> 확인필요
+- off policy 는 TINTHER_DATA_SHARDING=shard
+- off policy 에서 shard stragegy를 결정해주세요. -> 통신이 필요없는 최적의 방법읓 찾아주세요 -> student shrading과 동일한 방식으로 하면 될까요?
+- _HTTPSamplerBackend 호출만 sharding. In-process student sampler(`_SamplerBackend`, eval용)는 영향 없음. 'teacher inference'에 집중하고 student eval에 부수효과 위험 회피
+- 정상 케이스에서는 student sharding과 동일한 rank-stride가 최적이고, edge case에서는 silent corruption보다 즉시 실패
+- 유저의 결정이 필요한 사항들은 유저에게 문의하세요.
+/plan
+
+
+
+TINTHER_DATA_SHARDING
+- "shard" — off-policy
+- "replica" — on-policy
+ㅏoff policy, on policy 에서 각각 teacher inference 하는 부분을 설명해주세요
