@@ -565,6 +565,42 @@ class _CheckpointStore:
             pass
 
 
+def _is_peft_adapter_dir(path: str | Path) -> bool:
+    p = Path(path)
+    return p.exists() and (p / "adapter_config.json").exists()
+
+
+def _has_tokenizer_files(path: str | Path) -> bool:
+    p = Path(path)
+    if not p.exists():
+        return False
+    return any(
+        (p / name).exists()
+        for name in (
+            "tokenizer.json",
+            "tokenizer.model",
+            "vocab.json",
+            "spiece.model",
+        )
+    )
+
+
+def _adapter_base_model_from_config(adapter_dir: str | Path) -> str | None:
+    config_path = Path(adapter_dir) / "adapter_config.json"
+    if not config_path.exists():
+        return None
+    try:
+        with config_path.open("r") as f:
+            adapter_config = json.load(f)
+    except Exception:
+        return None
+    base_model = adapter_config.get("base_model_name_or_path")
+    if base_model is None:
+        return None
+    base_model = str(base_model)
+    return base_model if base_model else None
+
+
 # ---------------------------------------------------------------------------
 # Loss functions
 # ---------------------------------------------------------------------------
@@ -885,8 +921,23 @@ class _TrainerBackend:
         self.accelerator: Accelerator = Accelerator(mixed_precision=mixed_precision)
         _DIST.ensure_initialized()
 
-        # Tokenizer
-        tok_source = _CheckpointStore.resolve(from_state) if from_state else model_name
+        state_dir = _CheckpointStore.resolve(from_state) if from_state else None
+        is_peft_state = state_dir is not None and _is_peft_adapter_dir(state_dir)
+        peft_base_source = (
+            _adapter_base_model_from_config(state_dir)
+            if is_peft_state and state_dir is not None
+            else None
+        )
+        if is_peft_state and peft_base_source is not None and model_name == from_state:
+            self.model_name = peft_base_source
+
+        # Tokenizer. Tinther checkpoints save tokenizer files next to the state,
+        # but external PEFT adapter dirs may not; fall back to the base model.
+        tok_source: str | Path = (
+            state_dir
+            if state_dir is not None and _has_tokenizer_files(state_dir)
+            else (peft_base_source or model_name)
+        )
         self.tokenizer = AutoTokenizer.from_pretrained(
             str(tok_source) if isinstance(tok_source, Path) else tok_source,
             trust_remote_code=True,
@@ -897,7 +948,9 @@ class _TrainerBackend:
         # Base model
         dtype = torch.bfloat16 if mixed_precision == "bf16" else torch.float16
         base_source = (
-            str(_CheckpointStore.resolve(from_state)) if from_state else model_name
+            (peft_base_source or model_name)
+            if is_peft_state
+            else (str(state_dir) if state_dir is not None else model_name)
         )
         trainer_attn_implementation, auto_attn = self._resolve_trainer_attn_implementation()
         model_kwargs: dict[str, Any] = {
@@ -947,8 +1000,15 @@ class _TrainerBackend:
             base.config.use_cache = False
         base.gradient_checkpointing_enable()
 
-        # LoRA adapter
-        if lora_rank and lora_rank > 0:
+        # LoRA adapter. State checkpoints produced by PeftModel.save_pretrained()
+        # are adapter-only dirs, so load the base model first and then attach the
+        # saved adapter instead of treating the checkpoint as a full HF model.
+        if is_peft_state:
+            from peft import PeftModel
+
+            assert state_dir is not None
+            self.model = PeftModel.from_pretrained(base, str(state_dir), is_trainable=True)
+        elif lora_rank and lora_rank > 0:
             from peft import LoraConfig, get_peft_model
 
             lora_config = LoraConfig(
@@ -1352,6 +1412,7 @@ class _TrainerBackend:
                     "user_metadata": self._user_metadata,
                     "model_name": self.model_name,
                     "lora_rank": self.lora_rank,
+                    "is_peft_adapter": _is_peft_adapter_dir(d),
                     "ts": time.time(),
                 },
             )
@@ -1365,25 +1426,30 @@ class _TrainerBackend:
         path, d = self._new_distributed_checkpoint_path("sampler", name)
         unwrapped = self.accelerator.unwrap_model(self.model)
         if _DIST.is_main:
+            is_peft_adapter = False
             try:
                 from peft import PeftModel
 
                 if isinstance(unwrapped, PeftModel):
-                    merged = unwrapped.merge_and_unload()
-                    merged.save_pretrained(str(d))
+                    # Do not call merge_and_unload() on the live training model:
+                    # it mutates the PeftModel in place and desynchronizes DDP
+                    # ranks. Save the adapter-only snapshot and let the sampler
+                    # load/merge it on its own inference copy.
+                    unwrapped.save_pretrained(str(d))
+                    is_peft_adapter = True
                 else:
                     unwrapped.save_pretrained(str(d))
             except Exception:
-                # Fall back to saving the adapter + base config; vllm can load
-                # the base and apply an adapter separately but our sampler
-                # expects a standalone model, so this path is best-effort.
                 unwrapped.save_pretrained(str(d))
+                is_peft_adapter = _is_peft_adapter_dir(d)
             self.tokenizer.save_pretrained(str(d))
             _CheckpointStore.write_meta(
                 path,
                 {
                     "user_metadata": self._user_metadata,
                     "model_name": self.model_name,
+                    "lora_rank": self.lora_rank,
+                    "is_peft_adapter": is_peft_adapter,
                     "ts": time.time(),
                 },
             )
@@ -1419,8 +1485,36 @@ class _SamplerBackend:
             return str(_CheckpointStore.resolve(self.model_ref))
         return self.model_ref
 
+    def _checkpoint_meta(self) -> dict[str, Any]:
+        if not self.model_ref.startswith("tinther://"):
+            return {}
+        return _CheckpointStore.read_meta(self.model_ref)
+
+    def _is_peft_adapter_checkpoint(self) -> bool:
+        return _is_peft_adapter_dir(self._resolve_model_path())
+
+    def _adapter_base_model(self) -> str:
+        path = self._resolve_model_path()
+        meta_model = self._checkpoint_meta().get("model_name")
+        config_model = _adapter_base_model_from_config(path)
+        if meta_model is not None and str(meta_model) in {self.model_ref, path}:
+            meta_model = None
+        base_model = meta_model or config_model
+        if not base_model:
+            raise TinkerError(
+                f"PEFT adapter checkpoint at {path} does not record a base model. "
+                "Expected meta.json:model_name or adapter_config.json:base_model_name_or_path."
+            )
+        return str(base_model)
+
     def _ensure_llm(self) -> None:
         if self._llm is not None:
+            return
+        if self._is_peft_adapter_checkpoint():
+            # vLLM cannot consume this adapter-only tinther checkpoint through
+            # the plain `model=` path. Use the HF sampler path, which loads the
+            # base model plus adapter into an isolated inference model.
+            self._ensure_hf()
             return
         if os.environ.get("TINTHER_SAMPLER_DISABLE_VLLM", "0") == "1":
             self._ensure_hf()
@@ -1455,15 +1549,28 @@ class _SamplerBackend:
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         path = self._resolve_model_path()
-        self._tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+        is_adapter = self._is_peft_adapter_checkpoint()
+        base_model = self._adapter_base_model() if is_adapter else path
+        tokenizer_source = path if is_adapter and _has_tokenizer_files(path) else base_model
+        self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=True)
         if self._tokenizer.pad_token_id is None:
             self._tokenizer.pad_token_id = self._tokenizer.eos_token_id
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        self._hf_model = AutoModelForCausalLM.from_pretrained(
-            path,
-            torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
+        cuda_available = torch.cuda.is_available()
+        device = f"cuda:{_DIST.local_rank}" if cuda_available else "cpu"
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model,
+            torch_dtype=torch.bfloat16 if cuda_available else torch.float32,
             trust_remote_code=True,
-        ).to(device)
+        )
+        if is_adapter:
+            from peft import PeftModel
+
+            peft_model = PeftModel.from_pretrained(model, path)
+            try:
+                model = peft_model.merge_and_unload()
+            except Exception:
+                model = peft_model
+        self._hf_model = model.to(device)
         self._hf_model.eval()
 
     def close(self) -> None:
