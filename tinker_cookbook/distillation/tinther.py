@@ -18,11 +18,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
 import shutil
 import sys
+import threading
 import time
 import types as _types_module
 import uuid
@@ -283,6 +285,14 @@ class _DistEnv:
         torch.distributed.broadcast_object_list(payload, src=0, group=self._gloo_group)
         return payload[0]
 
+    def all_gather_object(self, obj: T) -> list[T]:
+        if self.world_size <= 1:
+            return [obj]
+        self.ensure_initialized()
+        payload: list[T | None] = [None for _ in range(self.world_size)]
+        torch.distributed.all_gather_object(payload, obj, group=self._gloo_group)
+        return payload  # type: ignore[return-value]
+
     def all_reduce_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
         if self.world_size <= 1:
             return tensor
@@ -340,6 +350,156 @@ def _resolve_data_sharding() -> Literal["shard", "replica", "none"]:
             "expected one of: shard, replica, none."
         )
     return raw  # type: ignore[return-value]
+
+
+_HTTP_TEACHER_SHARD_SENTINEL_TOKEN_ID = -1
+
+
+class _HTTPTeacherShardState:
+    """Tracks one off-policy teacher-inference batch per rank."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._sample_calls = 0
+
+    def record_sample_call(self) -> None:
+        with self._lock:
+            self._sample_calls += 1
+
+    def pending_sample_calls(self) -> int:
+        with self._lock:
+            return self._sample_calls
+
+    def reset_sample_calls(self) -> int:
+        with self._lock:
+            count = self._sample_calls
+            self._sample_calls = 0
+            return count
+
+
+_HTTP_TEACHER_SHARD_STATE = _HTTPTeacherShardState()
+
+
+def _stable_token_hash(tokens: list[int]) -> int:
+    arr = np.asarray(tokens, dtype=np.int64)
+    h = hashlib.blake2b(digest_size=8)
+    h.update(len(tokens).to_bytes(8, "little", signed=False))
+    h.update(arr.tobytes())
+    return int.from_bytes(h.digest(), "little", signed=False)
+
+
+def _http_teacher_owner_rank_from_prompt_tokens(tokens: list[int]) -> int:
+    if _DIST.world_size <= 1:
+        return 0
+    # Off-policy teacher forcing passes model_input + last target token. The
+    # teacher distribution for every supervised target position is determined by
+    # model_input, so drop the appended last target for a stable per-datum owner.
+    owner_key_tokens = tokens[:-1] if tokens else tokens
+    return _stable_token_hash(owner_key_tokens) % _DIST.world_size
+
+
+def _http_teacher_prompt_logprobs_sharding_enabled(
+    include_prompt_logprobs: bool,
+) -> bool:
+    return (
+        include_prompt_logprobs
+        and _DIST.world_size > 1
+        and _resolve_data_sharding() == "shard"
+    )
+
+
+def _sharded_teacher_prompt_logprobs(
+    prompt_len: int,
+) -> list[list[tuple[int, float]] | None]:
+    return [[(_HTTP_TEACHER_SHARD_SENTINEL_TOKEN_ID, 0.0)] for _ in range(prompt_len)]
+
+
+def _datum_has_sharded_teacher_sentinel(datum: Datum) -> bool:
+    target_tokens = datum.loss_fn_inputs.get("target_tokens")
+    if target_tokens is None:
+        return False
+    arr = np.asarray(target_tokens.data)
+    return bool(arr.size and np.any(arr == _HTTP_TEACHER_SHARD_SENTINEL_TOKEN_ID))
+
+
+def _tensor_data_equal(a: TensorData, b: TensorData) -> bool:
+    return (
+        a.dtype == b.dtype
+        and tuple(a.shape) == tuple(b.shape)
+        and np.array_equal(np.asarray(a.data), np.asarray(b.data))
+    )
+
+
+def _loss_fn_inputs_equal(
+    a: dict[str, TensorData],
+    b: dict[str, TensorData],
+) -> bool:
+    if set(a) != set(b):
+        return False
+    return all(_tensor_data_equal(a[k], b[k]) for k in a)
+
+
+def _repair_sharded_teacher_datums(data_D: list[Datum]) -> list[Datum]:
+    """Fill non-owner sentinel datums with the owner rank's teacher outputs.
+
+    Teacher ownership is independent of batch order, while student training still
+    uses ``data_D[rank::world_size]``. Gathering per-index owner payloads restores
+    a full, ordered batch on every rank before student sharding happens.
+    """
+    if _DIST.world_size <= 1 or not data_D:
+        return data_D
+
+    local_payloads: list[dict[str, TensorData] | None] = [
+        None if _datum_has_sharded_teacher_sentinel(datum) else datum.loss_fn_inputs
+        for datum in data_D
+    ]
+    gathered_payloads = _DIST.all_gather_object(local_payloads)
+    if len(gathered_payloads) != _DIST.world_size:
+        raise TinkerError(
+            "TINTHER_DATA_SHARDING=shard: failed to gather HTTP teacher "
+            f"payloads from all ranks; got {len(gathered_payloads)} of "
+            f"{_DIST.world_size} ranks."
+        )
+
+    missing: list[int] = []
+    conflicts: list[int] = []
+    repaired: list[Datum] = []
+    expected_n = len(data_D)
+
+    for datum_idx, datum in enumerate(data_D):
+        payloads: list[dict[str, TensorData]] = []
+        for rank, rank_payloads in enumerate(gathered_payloads):
+            if len(rank_payloads) != expected_n:
+                raise TinkerError(
+                    "TINTHER_DATA_SHARDING=shard: ranks disagree on teacher "
+                    f"batch size; local={expected_n}, rank{rank}={len(rank_payloads)}."
+                )
+            payload = rank_payloads[datum_idx]
+            if payload is not None:
+                payloads.append(payload)
+
+        if not payloads:
+            missing.append(datum_idx)
+            repaired.append(datum)
+            continue
+
+        first_payload = payloads[0]
+        if any(not _loss_fn_inputs_equal(first_payload, payload) for payload in payloads[1:]):
+            conflicts.append(datum_idx)
+        repaired.append(Datum(model_input=datum.model_input, loss_fn_inputs=first_payload))
+
+    if missing or conflicts:
+        details: list[str] = []
+        if missing:
+            details.append(f"missing owner payloads at batch indices {missing[:10]}")
+        if conflicts:
+            details.append(f"conflicting owner payloads at batch indices {conflicts[:10]}")
+        raise TinkerError(
+            "TINTHER_DATA_SHARDING=shard: could not reconstruct sharded HTTP "
+            "teacher outputs before student training (" + "; ".join(details) + ")."
+        )
+
+    return repaired
 
 
 def _cache_root() -> Path:
@@ -887,9 +1047,37 @@ class _TrainerBackend:
         #          do not slice; sum local sizes via all-reduce to get the
         #          global denominator.
         sharding = _resolve_data_sharding()
+        teacher_shard_sample_count = _HTTP_TEACHER_SHARD_STATE.pending_sample_calls()
+        if teacher_shard_sample_count > 0 and sharding != "shard":
+            observed = _HTTP_TEACHER_SHARD_STATE.reset_sample_calls()
+            raise TinkerError(
+                "HTTP teacher sharding state is active, but "
+                f"TINTHER_DATA_SHARDING={sharding!r}; observed {observed} "
+                "teacher prompt-logprob calls before forward_backward."
+            )
+
         derived_global_bs: int | None = None
         if sharding == "shard":
             original_n = len(data_D)
+            http_teacher_sharding_active = teacher_shard_sample_count > 0
+            if http_teacher_sharding_active:
+                observed = _HTTP_TEACHER_SHARD_STATE.reset_sample_calls()
+                count_records = _DIST.all_gather_object((observed, original_n))
+                bad_count_records = [
+                    (rank, observed_n, batch_n)
+                    for rank, (observed_n, batch_n) in enumerate(count_records)
+                    if observed_n != batch_n
+                ]
+                if bad_count_records:
+                    raise TinkerError(
+                        "TINTHER_DATA_SHARDING=shard: HTTP teacher prompt-logprob "
+                        "call count does not match training batch size on all "
+                        f"ranks: {bad_count_records}. Teacher inference sharding requires "
+                        "exactly one prompt-logprob sample call per Datum before "
+                        "forward_backward."
+                    )
+                data_D = _repair_sharded_teacher_datums(data_D)
+
             if 0 < original_n < _DIST.world_size:
                 # Too few examples to split. Fallback: every rank computes the
                 # full batch; DDP averages identical gradients (no speedup, but
@@ -908,6 +1096,15 @@ class _TrainerBackend:
             elif original_n >= _DIST.world_size:
                 data_D = data_D[_DIST.rank :: _DIST.world_size]
                 derived_global_bs = original_n
+                if http_teacher_sharding_active and any(
+                    _datum_has_sharded_teacher_sentinel(datum) for datum in data_D
+                ):
+                    raise TinkerError(
+                        "TINTHER_DATA_SHARDING=shard: a non-owner HTTP teacher "
+                        "sentinel reached this rank's student shard after "
+                        "cross-rank repair; refusing to train on corrupt soft "
+                        "targets."
+                    )
             # else original_n == 0: every rank has no data — symmetric early
             # return below is safe.
         elif sharding == "replica":
@@ -923,6 +1120,13 @@ class _TrainerBackend:
                 )
             if global_n > 0:
                 derived_global_bs = global_n
+
+        if any(_datum_has_sharded_teacher_sentinel(datum) for datum in data_D):
+            raise TinkerError(
+                "Sharded HTTP teacher sentinel reached training data. This means "
+                "teacher inference sharding and student data sharding are out of "
+                "sync; refusing to train on corrupt soft targets."
+            )
 
         local_metric_sums: dict[str, float] = {}
         n_data = len(data_D)
@@ -1784,6 +1988,21 @@ class _HTTPSamplerBackend:
         topk_prompt_logprobs: int | None,
     ) -> SampleResponse:
         tokens = prompt.to_ints()
+        if _http_teacher_prompt_logprobs_sharding_enabled(include_prompt_logprobs):
+            _HTTP_TEACHER_SHARD_STATE.record_sample_call()
+            owner_rank = _http_teacher_owner_rank_from_prompt_tokens(tokens)
+            if owner_rank != _DIST.rank:
+                return SampleResponse(
+                    sequences=[
+                        _Sequence(
+                            tokens=[],
+                            logprobs=[],
+                            stop_reason="tinther_sharded_non_owner",
+                        )
+                    ],
+                    topk_prompt_logprobs=_sharded_teacher_prompt_logprobs(len(tokens)),
+                )
+
         body: dict[str, Any] = {
             "model": self.model_name,
             "prompt": tokens,
